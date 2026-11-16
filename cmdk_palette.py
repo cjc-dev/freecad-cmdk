@@ -798,11 +798,27 @@ class Palette(QtWidgets.QWidget):
         if target != current:
             self._select(target)
 
+    def _is_shortcut(self, event):
+        if _shortcut is None or _shortcut.key().isEmpty():
+            return False
+        try:
+            pressed = QtGui.QKeySequence(event.keyCombination())
+        except AttributeError:  # Qt5
+            pressed = QtGui.QKeySequence(int(event.modifiers()) | event.key())
+        return pressed == _shortcut.key()
+
     def eventFilter(self, obj, event):
         if obj is self.mw:
             if event.type() == QtCore.QEvent.Resize and self.isVisible():
                 self.setGeometry(self.mw.rect())
             return False
+        # The search box would otherwise swallow the shortcut as an editing key
+        # (Ctrl+K deletes to the end of the line on Linux and Windows).
+        if event.type() in (QtCore.QEvent.ShortcutOverride, QtCore.QEvent.KeyPress) and self._is_shortcut(event):
+            if self.isVisible():
+                self.close_palette()
+            event.accept()
+            return True
         if event.type() == QtCore.QEvent.KeyPress:
             key = event.key()
             if key == Qt.Key_Escape:

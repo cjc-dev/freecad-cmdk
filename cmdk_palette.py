@@ -1,7 +1,9 @@
 """Cmd+K command palette for FreeCAD."""
 
+import json
 import os
 import re
+import time
 
 import FreeCAD
 import FreeCADGui as Gui
@@ -10,12 +12,18 @@ from PySide import QtCore, QtGui, QtWidgets
 Qt = QtCore.Qt
 
 PARAMS = "User parameter:BaseApp/Preferences/Mod/CmdK"
+SHORTCUTS = "User parameter:BaseApp/Preferences/Shortcut"
+COMMAND = "CmdK_Open"
+DEFAULT_SHORTCUT = "Ctrl+K"
 MAX_RECENT = 6
+MAX_MOST_USED = 5
 MAX_RESULTS = 60
-ROW_H = 34
-HEAD_H = 30
-LIST_MAX_H = 338
-PANEL_W = 640
+# Rows whose labels are file names; never written to the usage file.
+PRIVATE_COMMANDS = ("Std_RecentFiles", "Std_RecentMacros")
+USAGE_LIMITS = {"queries": 500, "misses": 200, "pairs": 1000}
+DEFAULT_WIDTH = 640
+DEFAULT_ROWS = 10
+MIN_TEXT = 14
 
 # Fallback when the active theme's colours cannot be read.
 DARK = dict(bg="#09090b", border="#27272a", fg="#fafafa", muted="#a1a1aa", accent="#27272a", dim=120)
@@ -24,6 +32,100 @@ CATEGORY_NAMES = {"Std": "FreeCAD", "TechDraw": "TechDraw", "OpenSCAD": "OpenSCA
 
 _palette = None
 _shortcut = None
+_watch = None
+
+
+class Usage:
+    """Local command-usage statistics. Nothing here leaves the machine."""
+
+    def __init__(self):
+        self.path = os.path.join(FreeCAD.getUserAppDataDir(), "CmdK", "usage.json")
+        self.previous = None
+        self.data = self._empty()
+        try:
+            with open(self.path, encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict) and loaded.get("version") == 1:
+                self.data.update(loaded)
+        except (OSError, ValueError):
+            pass
+
+    @staticmethod
+    def _empty():
+        return {"version": 1, "commands": {}, "queries": {}, "misses": {}, "pairs": {}}
+
+    @staticmethod
+    def enabled():
+        return FreeCAD.ParamGet(PARAMS).GetBool("RecordUsage", True)
+
+    def record_run(self, row, query, seconds):
+        if not self.enabled() or row["id"].startswith("own:") or row["name"] in PRIVATE_COMMANDS:
+            return
+        key = row["id"]
+        entry = self.data["commands"].setdefault(key, {"count": 0, "seconds": 0.0, "keys": 0})
+        entry.update(
+            label=row["label"], count=entry["count"] + 1, last=int(time.time()),
+            seconds=round(entry["seconds"] + seconds, 2), keys=entry["keys"] + len(query),
+        )
+        typed = query.strip().lower()
+        if typed:
+            picks = self.data["queries"].setdefault(typed, {})
+            picks[key] = picks.get(key, 0) + 1
+        if self.previous:
+            pair = "%s > %s" % (self.previous, key)
+            self.data["pairs"][pair] = self.data["pairs"].get(pair, 0) + 1
+        self.previous = key
+        self.save()
+
+    def record_miss(self, query):
+        typed = query.strip().lower()
+        if typed and self.enabled():
+            self.data["misses"][typed] = self.data["misses"].get(typed, 0) + 1
+            self.save()
+
+    def count(self, key):
+        return self.data["commands"].get(key, {}).get("count", 0)
+
+    def picked(self, query):
+        """Commands previously chosen for this query, or for one it is a prefix of."""
+        typed, found = query.strip().lower(), set()
+        if typed:
+            for stored, picks in self.data["queries"].items():
+                if stored.startswith(typed):
+                    found.update(picks)
+        return found
+
+    def most_used(self):
+        ranked = sorted(self.data["commands"].items(), key=lambda kv: -kv[1]["count"])
+        return [key for key, entry in ranked if entry["count"] >= 2]
+
+    def save(self):
+        for name, limit in USAGE_LIMITS.items():
+            table = self.data[name]
+            if len(table) > limit:
+                weight = (lambda v: sum(v.values())) if name == "queries" else (lambda v: v)
+                keep = sorted(table, key=lambda k: -weight(table[k]))[:limit]
+                self.data[name] = {k: table[k] for k in keep}
+        self.write(self.path, self.data)
+
+    def export(self, path):
+        report = dict(self.data, exported=int(time.time()), freecad=".".join(FreeCAD.Version()[:3]))
+        self.write(path, report)
+
+    @staticmethod
+    def write(path, data):
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path + ".tmp", "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=1, sort_keys=True)
+            os.replace(path + ".tmp", path)
+        except OSError as exc:
+            FreeCAD.Console.PrintWarning("CmdK: could not write %s: %s\n" % (path, exc))
+
+    def clear(self):
+        self.data = self._empty()
+        self.previous = None
+        self.save()
 
 
 def _mix(a, b, t):
@@ -68,6 +170,24 @@ def theme_tokens(mw):
         return DARK
 
 
+def metrics():
+    """Sizes in pixels, scaled from the text size: FreeCAD's own font size
+    unless the user picked one in the palette settings."""
+    params = FreeCAD.ParamGet(PARAMS)
+    text = params.GetInt("TextSize", 0)
+    if text <= 0:
+        app = QtWidgets.QApplication.instance()
+        text = max(MIN_TEXT, QtGui.QFontInfo(app.font()).pixelSize())
+    text = min(max(text, 10), 32)
+    k = text / 14.0
+    row = int(round(34 * k))
+    rows = min(max(params.GetInt("Rows", DEFAULT_ROWS), 4), 30)
+    return dict(text=text, small=int(round(12 * k)), row=row, head=int(round(30 * k)),
+                input=int(round(46 * k)), icon=int(round(16 * k)),
+                list=int((rows - 0.3) * row) + 8,
+                width=min(max(params.GetInt("Width", DEFAULT_WIDTH), 360), 1600))
+
+
 def _clean(text):
     text = re.sub(r"&(.)", r"\1", text or "")
     text = re.sub(r"^\d+\s+", "", text)
@@ -109,7 +229,7 @@ def collect_items():
     """
     items, seen = {}, set()
     for name in Gui.listCommands():
-        if name == "Std_Workbench":
+        if name in ("Std_Workbench", COMMAND):
             continue
         try:
             cmd = Gui.Command.get(name)
@@ -231,7 +351,7 @@ class Delegate(QtWidgets.QStyledItemDelegate):
 
     def sizeHint(self, option, index):
         row = index.data(Qt.UserRole)
-        return QtCore.QSize(10, HEAD_H if "heading" in row else ROW_H)
+        return QtCore.QSize(10, self.p.m["head"] if "heading" in row else self.p.m["row"])
 
     def _font(self, px, medium=False):
         f = QtGui.QFont(self.p.font())
@@ -242,11 +362,12 @@ class Delegate(QtWidgets.QStyledItemDelegate):
     def paint(self, painter, option, index):
         row = index.data(Qt.UserRole)
         t = self.p.tokens
+        m = self.p.m
         painter.save()
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
         r = option.rect.adjusted(6, 1, -6, -1)
         if "heading" in row:
-            painter.setFont(self._font(12, True))
+            painter.setFont(self._font(m["small"], True))
             painter.setPen(QtGui.QColor(t["muted"]))
             painter.drawText(r.adjusted(8, 6, -8, 0), Qt.AlignVCenter | Qt.AlignLeft, row["heading"])
             painter.restore()
@@ -264,7 +385,7 @@ class Delegate(QtWidgets.QStyledItemDelegate):
             fg.setAlpha(150)
             muted.setAlpha(120)
 
-        icon_rect = QtCore.QRect(r.left() + 10, r.center().y() - 7, 16, 16)
+        icon_rect = QtCore.QRect(r.left() + 10, r.center().y() - m["icon"] // 2 + 1, m["icon"], m["icon"])
         action = row.get("action")
         icon = row.get("icon") or (action.icon() if action is not None else None)
         if icon is not None and not icon.isNull():
@@ -276,7 +397,7 @@ class Delegate(QtWidgets.QStyledItemDelegate):
             painter.drawEllipse(QtCore.QRectF(icon_rect.center().x() - 1.5, icon_rect.center().y() - 1.5, 4, 4))
 
         right = r.right() - 10
-        painter.setFont(self._font(12))
+        painter.setFont(self._font(m["small"]))
         fm = painter.fontMetrics()
         painter.setPen(muted)
         notes = (row.get("shortcut"), row.get("hint")) if enabled else ("Unavailable right now",)
@@ -286,9 +407,10 @@ class Delegate(QtWidgets.QStyledItemDelegate):
                 painter.drawText(QtCore.QRect(right - w, r.top(), w, r.height()), Qt.AlignVCenter, text)
                 right -= w + 14
 
-        painter.setFont(self._font(14))
+        painter.setFont(self._font(m["text"]))
         painter.setPen(fg)
-        text_rect = QtCore.QRect(r.left() + 36, r.top(), right - r.left() - 36, r.height())
+        left = r.left() + 20 + m["icon"]
+        text_rect = QtCore.QRect(left, r.top(), right - left, r.height())
         label = painter.fontMetrics().elidedText(row["label"], Qt.ElideRight, text_rect.width())
         painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, label)
         painter.restore()
@@ -316,8 +438,11 @@ class Palette(QtWidgets.QWidget):
         super().__init__(mw)
         self.mw = mw
         self.tokens = DARK
+        self.m = metrics()
         self.items = {}
         self.prev_focus = None
+        self.usage = Usage()
+        self.opened_at = 0.0
         self.hide()
 
         self.panel = QtWidgets.QFrame(self)
@@ -334,7 +459,6 @@ class Palette(QtWidgets.QWidget):
         self.input.setObjectName("cmdkInput")
         self.input.setPlaceholderText("Type a command or search…")
         self.input.setFrame(False)
-        self.input.setFixedHeight(46)
         self.input.setAttribute(Qt.WA_MacShowFocusRect, False)
         head.addWidget(self.input)
         layout.addLayout(head)
@@ -364,7 +488,6 @@ class Palette(QtWidgets.QWidget):
         self.empty = QtWidgets.QLabel("No results found.")
         self.empty.setObjectName("cmdkEmpty")
         self.empty.setAlignment(Qt.AlignCenter)
-        self.empty.setFixedHeight(68)
         layout.addWidget(self.empty)
 
         # FreeCAD re-raises its overlay panels and updates command states on
@@ -385,8 +508,11 @@ class Palette(QtWidgets.QWidget):
     def open_palette(self):
         self.prev_focus = QtWidgets.QApplication.focusWidget()
         self.tokens = theme_tokens(self.mw)
+        self.m = metrics()
         self._apply_style()
         self.items = collect_items()
+        self.items.update(self._own_items())
+        self.opened_at = time.monotonic()
         self.input.blockSignals(True)
         self.input.clear()
         self.input.blockSignals(False)
@@ -398,12 +524,12 @@ class Palette(QtWidgets.QWidget):
         self.keep_fresh.start()
 
     def _freshen(self):
-        siblings = [c for c in self.mw.children() if isinstance(c, QtWidgets.QWidget) and not c.isWindow()]
-        if siblings and siblings[-1] is not self:
-            self.raise_()
+        self.raise_()
         self.view.viewport().update()
 
     def close_palette(self):
+        if self.isVisible() and not self.model.rows:
+            self.usage.record_miss(self.input.text())
         self.keep_fresh.stop()
         self.hide()
         if self.prev_focus is not None:
@@ -414,16 +540,18 @@ class Palette(QtWidgets.QWidget):
         self.prev_focus = None
 
     def _apply_style(self):
-        t = self.tokens
+        t = dict(self.tokens, **self.m)
+        self.input.setFixedHeight(t["input"])
+        self.empty.setFixedHeight(t["row"] * 2)
         self.panel.setStyleSheet(
             """
             #cmdkPanel { background: %(bg)s; border: 1px solid %(border)s; border-radius: 12px; }
             #cmdkRule { background: %(border)s; border: none; }
             #cmdkInput { background: transparent; border: none; border-radius: 0; padding: 0; margin: 0;
-                         min-height: 46px; max-height: 46px; font-weight: normal;
-                         color: %(fg)s; font-size: 14px; selection-background-color: %(muted)s;
+                         min-height: %(input)dpx; max-height: %(input)dpx; font-weight: normal;
+                         color: %(fg)s; font-size: %(text)dpx; selection-background-color: %(muted)s;
                          selection-color: %(bg)s; }
-            #cmdkEmpty { background: transparent; border: none; color: %(muted)s; font-size: 14px; }
+            #cmdkEmpty { background: transparent; border: none; color: %(muted)s; font-size: %(text)dpx; }
             #cmdkList { background: transparent; border: none; outline: 0; padding: 4px 0; margin: 0; }
             #cmdkList::item { border: none; background: transparent; }
             """
@@ -450,6 +578,80 @@ class Palette(QtWidgets.QWidget):
             row["hint"] = item["cat"]
         return row
 
+    def _own_items(self):
+        def own(key, label, tip, call):
+            return dict(id="own:" + key, label=label, cat="Command Palette", name="CmdK_" + key,
+                        tip=tip, action=None, run=("call", call))
+
+        return {
+            "own:export": own("ExportUsage", "Export Usage Stats",
+                              "Save the local command usage statistics to a JSON file", self.export_usage),
+            "own:settings": own("Settings", "Command Palette Settings",
+                                "Change the text size, width and height of the command palette",
+                                self.open_settings),
+            "own:clear": own("ClearUsage", "Clear Usage Stats",
+                             "Delete the local command usage statistics", self.clear_usage),
+        }
+
+    def export_usage(self):
+        start = os.path.join(os.path.expanduser("~"), "cmdk-usage.json")
+        path, _filter = QtWidgets.QFileDialog.getSaveFileName(self.mw, "Export usage stats", start, "JSON (*.json)")
+        if path:
+            self.usage.export(path)
+
+    def clear_usage(self):
+        box = QtWidgets.QMessageBox
+        answer = box.question(self.mw, "Clear usage stats",
+                              "Delete the command usage statistics stored on this computer?")
+        if answer == box.Yes:
+            self.usage.clear()
+
+    def open_settings(self):
+        params = FreeCAD.ParamGet(PARAMS)
+        dialog = QtWidgets.QDialog(self.mw)
+        dialog.setWindowTitle("Command Palette Settings")
+        form = QtWidgets.QFormLayout(dialog)
+
+        def spin(low, high, step, value, suffix="", auto=False):
+            box = QtWidgets.QSpinBox()
+            box.setRange(low, high)
+            box.setSingleStep(step)
+            box.setSuffix(suffix)
+            if auto:
+                box.setSpecialValueText("Match FreeCAD")
+            box.setValue(value)
+            return box
+
+        text = spin(9, 32, 1, max(params.GetInt("TextSize", 0), 9), " px", auto=True)
+        width = spin(360, 1600, 20, params.GetInt("Width", DEFAULT_WIDTH), " px")
+        rows = spin(4, 30, 1, params.GetInt("Rows", DEFAULT_ROWS))
+        record = QtWidgets.QCheckBox("Learn from the commands I run")
+        record.setChecked(Usage.enabled())
+        note = QtWidgets.QLabel(
+            "Counts which commands you run and what you typed to find them, so your usual "
+            "picks rank higher and appear under Most used. Stored in a file on this computer "
+            "and never sent anywhere. If unticked, nothing new is counted; what was already "
+            "counted stays until you run Clear Usage Stats."
+        )
+        note.setWordWrap(True)
+        note.setEnabled(False)
+        note.setMinimumWidth(380)
+        form.addRow("Text size", text)
+        form.addRow("Width", width)
+        form.addRow("Rows shown", rows)
+        form.addRow(record)
+        form.addRow(note)
+        box = QtWidgets.QDialogButtonBox
+        buttons = box(box.Ok | box.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if (getattr(dialog, "exec_", None) or dialog.exec)():
+            params.SetInt("TextSize", 0 if text.value() == 9 else text.value())
+            params.SetInt("Width", width.value())
+            params.SetInt("Rows", rows.value())
+            params.SetBool("RecordUsage", record.isChecked())
+
     def _recent(self):
         raw = FreeCAD.ParamGet(PARAMS).GetString("Recent", "")
         return [k for k in raw.split("|") if k]
@@ -463,12 +665,16 @@ class Palette(QtWidgets.QWidget):
         if query.strip():
             scored = []
             recent = self._recent()
+            picked = self.usage.picked(query)
             for it in items.values():
                 s = score(query, it)
                 if s is None:
                     continue
                 if it["id"] in recent:
                     s += 12
+                if it["id"] in picked:
+                    s += 40
+                s += min(self.usage.count(it["id"]), 20) * 1.5
                 if it.get("action") is not None and not self.is_enabled(it):
                     s -= 30
                 scored.append((-s, it["label"].lower(), it))
@@ -490,6 +696,12 @@ class Palette(QtWidgets.QWidget):
         if recent:
             rows.append({"heading": "Recent"})
             rows.extend(self._row(m, hint=True) for m in recent)
+
+        shown = set(m["id"] for m in recent)
+        most = [items[k] for k in self.usage.most_used() if k in items and k not in shown][:MAX_MOST_USED]
+        if most:
+            rows.append({"heading": "Most used"})
+            rows.extend(self._row(m, hint=True) for m in most)
 
         for title, names in toolbar_groups(self.mw):
             members = []
@@ -516,8 +728,8 @@ class Palette(QtWidgets.QWidget):
         self.view.setVisible(has)
         self.empty.setVisible(not has)
         if has:
-            height = sum(HEAD_H if "heading" in r else ROW_H for r in rows) + 8
-            self.view.setFixedHeight(min(height, LIST_MAX_H))
+            height = sum(self.m["head"] if "heading" in r else self.m["row"] for r in rows) + 8
+            self.view.setFixedHeight(min(height, self.m["list"]))
             self.view.scrollToTop()
             self._select(self._next_item(-1, 1))
         self._place()
@@ -525,11 +737,11 @@ class Palette(QtWidgets.QWidget):
     # -- geometry / painting -------------------------------------------------
 
     def _place(self):
-        width = min(PANEL_W, self.width() - 32)
+        width = min(self.m["width"], self.width() - 32)
         self.panel.setFixedWidth(max(width, 240))
         self.panel.adjustSize()
         x = (self.width() - self.panel.width()) // 2
-        y = max(24, min(int(self.height() * 0.16), self.height() - 46 - LIST_MAX_H - 40))
+        y = max(24, min(int(self.height() * 0.16), self.height() - self.m["input"] - self.m["list"] - 40))
         self.panel.move(x, y)
         self.update()
 
@@ -619,7 +831,9 @@ class Palette(QtWidgets.QWidget):
         row = self.model.rows[index.row()]
         if "heading" in row or not self.is_enabled(row):
             return
-        self._remember(row["id"])
+        if not row["id"].startswith("own:"):
+            self._remember(row["id"])
+        self.usage.record_run(row, self.input.text(), time.monotonic() - self.opened_at)
         self.close_palette()
         QtCore.QTimer.singleShot(0, lambda: self._run(row))
 
@@ -632,17 +846,54 @@ class Palette(QtWidgets.QWidget):
                 Gui.runCommand(run[1], run[2])
             elif run[0] == "workbench":
                 Gui.activateWorkbench(run[1])
+            elif run[0] == "call":
+                run[1]()
         except Exception as exc:
             FreeCAD.Console.PrintError("CmdK: could not run %s: %s\n" % (row["label"], exc))
 
 
+class OpenCommand:
+    """Registers the palette as a FreeCAD command so its shortcut can be
+    changed in Tools > Customize > Keyboard like any other."""
+
+    def GetResources(self):
+        return {"MenuText": "Command Palette", "ToolTip": "Search for a command and run it",
+                "Accel": DEFAULT_SHORTCUT}
+
+    def Activated(self):
+        if _palette is not None:
+            _palette.toggle()
+
+    def IsActive(self):
+        return True
+
+
+class ShortcutWatcher:
+    def onChange(self, group, name):
+        if name == COMMAND:
+            apply_shortcut()
+
+
+def apply_shortcut():
+    keys = FreeCAD.ParamGet(SHORTCUTS).GetString(COMMAND, DEFAULT_SHORTCUT)
+    if _shortcut is not None:
+        _shortcut.setKey(QtGui.QKeySequence(keys))
+
+
 def install():
-    global _palette, _shortcut
+    global _palette, _shortcut, _watch
     mw = Gui.getMainWindow()
     if mw is None or _palette is not None:
         return
     _palette = Palette(mw)
-    _shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+K"), mw)
+    Gui.addCommand(COMMAND, OpenCommand())
+    # QShortcut lives in QtGui on Qt6 and QtWidgets on Qt5.
+    shortcut_class = getattr(QtGui, "QShortcut", None) or QtWidgets.QShortcut
+    _shortcut = shortcut_class(mw)
+    apply_shortcut()
+    group = FreeCAD.ParamGet(SHORTCUTS)
+    _watch = (group, ShortcutWatcher())
+    group.Attach(_watch[1])
     _shortcut.setContext(Qt.ApplicationShortcut)
     _shortcut.activated.connect(_palette.toggle)
     _shortcut.activatedAmbiguously.connect(_palette.toggle)
